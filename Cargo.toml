@@ -60,6 +60,6 @@ type_marked_deprecated = { required-update = "minor" }
 type_method_marked_deprecated = { required-update = "minor" }
 
 [patch.crates-io]
-noq = { path = "/home/bit/Code/rust/noq/noq" }
-noq-proto = { path = "/home/bit/Code/rust/noq/noq-proto" }
-noq-udp = { path = "/home/bit/Code/rust/noq/noq-udp" }
+noq = { git = "https://github.com/n0-computer/noq", branch = "feat/multi-socket" }
+noq-proto = { git = "https://github.com/n0-computer/noq", branch = "feat/multi-socket" }
+noq-udp = { git = "https://github.com/n0-computer/noq", branch = "feat/multi-socket" }
