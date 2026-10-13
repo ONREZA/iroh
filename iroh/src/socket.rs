@@ -932,7 +932,7 @@ impl EndpointInner {
         let shutdown_state = ShutdownState::default();
         let shutdown_token = shutdown_state.at_endpoint_closed.child_token();
 
-        let transports = Transports::bind(
+        let (transports, transport_recvs) = Transports::bind(
             &transport_configs,
             relay_actor_config,
             &metrics,
@@ -1019,10 +1019,10 @@ impl EndpointInner {
 
         let runtime = Arc::new(Runtime::new(secret_key.public()));
 
-        let endpoint = noq::Endpoint::new_with_abstract_socket(
+        let endpoint = noq::Endpoint::new_with_abstract_sockets(
             endpoint_config,
             Some(server_config),
-            Box::new(Transport::new(sock.clone(), transports)),
+            Transport::sockets(sock.clone(), Arc::new(transports), transport_recvs),
             runtime.clone(),
         )
         .map_err(|err| e!(BindError::CreateQuicEndpoint, err))?;
