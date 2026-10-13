@@ -8,6 +8,8 @@ use std::{
     task::{Context, Poll},
 };
 
+use n0_future::time::{Duration, Sleep};
+
 use bytes::Bytes;
 use ipnet::IpNet;
 use iroh_base::{CustomAddr, EndpointId, RelayUrl, TransportAddr};
@@ -40,11 +42,23 @@ pub(crate) use self::relay::{
     HomeRelayWatch, RelayActorConfig, RelayConnectionFailure, RelayConnectionState, RelayTransport,
 };
 
-/// How many times a transport may error on `poll_recv` in a row before we stop polling it.
+/// How many times a transport may error on `poll_recv` in a row before we back off.
 ///
-/// Each transport is its own noq socket, so a failing one goes quiet instead of taking the
-/// endpoint down with it.
+/// Up to here noq polls the transport again right away, so a short glitch costs nothing.
+/// After it, each retry waits [`RECV_ERROR_BACKOFF`].
 const MAX_CONSECUTIVE_RECV_ERRORS: usize = 8;
+
+/// Delay between `poll_recv` retries once a transport failed [`MAX_CONSECUTIVE_RECV_ERRORS`]
+/// times in a row.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// How many consecutive `poll_recv` errors it takes to give a transport up.
+///
+/// Then the error is returned to noq, which removes this transport's socket from the
+/// endpoint. If it was the last socket, the endpoint stops. With the backoff above this
+/// gives a broken transport about half a minute to recover, e.g. through a rebind after a
+/// network change, before it is dropped.
+const MAX_RECV_ERRORS_BEFORE_GIVING_UP: usize = MAX_CONSECUTIVE_RECV_ERRORS + 30;
 
 /// Manages the different underlying data transports that the socket can support.
 ///
@@ -985,13 +999,18 @@ impl TransportsSender {
                 }
             }
             FourTuple::Custom { remote, local } => {
+                let mut has_valid_sender = false;
                 for sender in &mut self.custom {
                     if sender.is_valid_send_addr(remote) {
+                        has_valid_sender = true;
                         match sender.poll_send(cx, remote, local.as_ref(), transmit) {
                             Poll::Pending => {}
                             Poll::Ready(res) => return Poll::Ready(res),
                         }
                     }
+                }
+                if has_valid_sender {
+                    return Poll::Pending;
                 }
             }
         }
@@ -1022,6 +1041,8 @@ pub(crate) struct Transport {
     /// Cache for per-packet recv info, to speed up access
     recv_infos: Box<[RecvInfo; noq_udp::BATCH_SIZE]>,
     consecutive_recv_failures: usize,
+    /// Set while we wait before retrying a failing transport, see [`RECV_ERROR_BACKOFF`].
+    recv_backoff: Option<Pin<Box<Sleep>>>,
 }
 
 impl Transport {
@@ -1041,6 +1062,7 @@ impl Transport {
                     recv,
                     recv_infos: Default::default(),
                     consecutive_recv_failures: 0,
+                    recv_backoff: None,
                 }) as Box<dyn noq::AsyncUdpSocket>
             })
             .collect()
@@ -1066,6 +1088,10 @@ impl noq::AsyncUdpSocket for Transport {
         if self.sock.is_closed() {
             return Poll::Pending;
         }
+        if let Some(backoff) = &mut self.recv_backoff {
+            n0_future::ready!(backoff.as_mut().poll(cx));
+            self.recv_backoff = None;
+        }
 
         match self
             .recv
@@ -1080,12 +1106,22 @@ impl noq::AsyncUdpSocket for Transport {
                 Poll::Ready(Ok(n))
             }
             Poll::Ready(Err(err)) => {
+                // Transports swallow the errors they know to be transient (see e.g.
+                // netwatch's read error handling). What reaches us is unclassified, so we
+                // retry: first right away, then with a delay, and finally give up.
                 self.consecutive_recv_failures += 1;
-                debug!(transport = %self.recv, "recv error: {err:#}");
+                if self.consecutive_recv_failures >= MAX_RECV_ERRORS_BEFORE_GIVING_UP {
+                    warn!(transport = %self.recv, "transport failed to receive repeatedly, giving it up: {err:#}");
+                    return Poll::Ready(Err(err));
+                }
+                debug!(transport = %self.recv, failures = self.consecutive_recv_failures, "recv error: {err:#}");
                 if self.consecutive_recv_failures >= MAX_CONSECUTIVE_RECV_ERRORS {
-                    // Go quiet. We register no waker, so noq does not poll us again until it
-                    // stops the socket. The other transports keep the endpoint alive.
-                    warn!(transport = %self.recv, "transport failed to receive repeatedly, no longer polling it");
+                    let mut backoff = Box::pin(n0_future::time::sleep(RECV_ERROR_BACKOFF));
+                    // Register our waker with the timer, so noq polls us again when it fires.
+                    if backoff.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Ok(0));
+                    }
+                    self.recv_backoff = Some(backoff);
                     return Poll::Pending;
                 }
                 // Let noq poll again right away, like a transient error.
@@ -1192,7 +1228,7 @@ impl noq::UdpSender for Sender {
     ) -> Poll<io::Result<()>> {
         // On errors this methods prefers returning Ok(()) to Noq.  Returning an error
         // should only happen if the error is permanent and fatal and it will never be
-        // possible to send anything again.  Doing so kills the Noq EndpointDriver.  Most
+        // possible to send anything again.  Doing so closes the connection.  Most
         // send errors are intermittent errors, returning Ok(()) in those cases will mean
         // Noq eventually considers the packets that had send errors as lost and will try
         // and re-send them.
@@ -1310,12 +1346,11 @@ impl noq::UdpSender for Sender {
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => {
-                // We do not want to block the next send which might be on a
-                // different transport.  Instead we let Noq handle this as a lost
-                // datagram.
-                // TODO: Revisit this: we might want to do something better.
-                trace!(dst=%network_path, "transport pending, dropped transmit");
-                Poll::Ready(Ok(()))
+                // noq holds this transmit back and keeps sending to other destinations in
+                // the meantime, so a full transport only slows down its own paths. Before
+                // noq could do that, we had to drop the datagram here.
+                trace!(dst=%network_path, "transport pending");
+                Poll::Pending
             }
         }
     }
