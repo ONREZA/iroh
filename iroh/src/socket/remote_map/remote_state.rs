@@ -65,6 +65,9 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 /// Even if we have some non-relay route that works.
 const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Reconsider loss independently of address updates or the slow RTT upgrade cadence.
+const PATH_RESPONSIVENESS_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The time after which an idle [`RemoteStateActor`] stops.
 ///
 /// The actor only enters the idle state if no connections are active and no inbox senders exist
@@ -248,6 +251,10 @@ impl RemoteStateActor {
         let idle_timeout = time::sleep(ACTOR_MAX_IDLE_TIMEOUT);
         n0_future::pin!(idle_timeout);
 
+        let mut check_responsiveness = time::interval(PATH_RESPONSIVENESS_INTERVAL);
+        check_responsiveness.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        n0_future::pin!(check_responsiveness);
+
         let check_connections = time::interval(UPGRADE_INTERVAL);
         n0_future::pin!(check_connections);
 
@@ -274,6 +281,10 @@ impl RemoteStateActor {
                 _ = shutdown_token.cancelled() => {
                     trace!("actor cancelled");
                     break;
+                }
+                // Prioritize bounded native maintenance over a continuously busy inbox.
+                _ = check_responsiveness.tick(), if !self.connections.is_empty() => {
+                    self.maintain_path_responsiveness();
                 }
                 Some(()) = send_tasks.next(), if !send_tasks.is_empty() => {}
                 msg = inbox.recv() => {
@@ -647,8 +658,8 @@ impl RemoteStateActor {
 
     /// Selects the preferred path by invoking the configured [`PathSelector`].
     ///
-    /// The selected path is added to any connections which do not yet have it.  Any unused
-    /// direct paths are closed for all connections.
+    /// The selected path is added to any connections which do not yet have it. One
+    /// validated alternate IP path stays open as Backup for recovery without reconnecting.
     #[instrument(skip_all)]
     fn select_path(&mut self) {
         let current_path = self.state.selected_path.as_ref();
@@ -678,8 +689,8 @@ impl RemoteStateActor {
     /// Propagates a change of [`State::selected_path`] to noq.
     ///
     /// Iterates over all connections and applies the selected path as follows:
-    /// - Closes non-selected IP paths (but keeps one IP path open still)
-    /// - Sets all non-selected paths to [`PathStatus::Backup`]
+    /// - Keeps one alternate IP path; the client closes redundant IP paths
+    /// - Sets all remaining non-selected paths to [`PathStatus::Backup`]
     /// - Opens the selected path if it does not exist on the connection
     /// - Sets the selected path to [`PathStatus::Available`]
     fn apply_selected_path(&mut self) {
@@ -699,22 +710,30 @@ impl RemoteStateActor {
             self.state
                 .open_path_on_conn(*conn_id, conn_state, &conn, &selected);
 
+            let backup_ctx = PathSelectionContext::backup(
+                &selected,
+                conn_state
+                    .paths
+                    .iter()
+                    .map(|(id, addr)| PathSelectionData::live(addr, *id, conn.clone()))
+                    .collect(),
+            );
+            let backup = self.state.path_selector.select(&backup_ctx);
+
             for (path_id, path_fourtuple) in conn_state.paths.iter() {
                 let Some(path) = conn.path(*path_id) else {
                     continue;
                 };
 
-                // Closes redundant IP paths so that at most one remains per connection.
-                //
-                // Relay and custom paths are kept open. Only the client closes paths,
-                // to avoid the client and server independently closing different paths
-                // and racing to abandon the last one.
+                // Reserve native validation capacity while retaining one live fallback.
+                // Only the client closes paths, so the peers cannot prune each other's backup.
                 if conn.side().is_client()
                     && path_fourtuple.is_ip()
                     && path_fourtuple != &selected
+                    && backup.selected() != Some(path_fourtuple)
                     && conn_state.paths.values().filter(|a| a.is_ip()).count() > 1
                 {
-                    trace!(?path_fourtuple, %conn_id, %path_id, "closing direct path");
+                    trace!(?path_fourtuple, %conn_id, %path_id, "closing redundant direct path");
                     match path.close() {
                         Err(noq_proto::ClosePathError::MultipathNotNegotiated) => {
                             error!("multipath not negotiated");
@@ -722,10 +741,7 @@ impl RemoteStateActor {
                         Err(noq_proto::ClosePathError::LastOpenPath) => {
                             error!("could not close last open path");
                         }
-                        Err(noq_proto::ClosePathError::ClosedPath) => {
-                            // We already closed this.
-                        }
-                        Ok(()) => {}
+                        Err(noq_proto::ClosePathError::ClosedPath) | Ok(()) => {}
                     }
                     continue;
                 }
@@ -737,6 +753,25 @@ impl RemoteStateActor {
 
             // Record the new selected path in the path watcher.
             conn_state.path_state.record_selected(&selected);
+        }
+    }
+
+    fn maintain_path_responsiveness(&mut self) {
+        use crate::socket::biased_rtt_path_selector::UNRESPONSIVE_PTO_COUNT;
+
+        self.select_path();
+        let missing_responsive_path = self.connections.values().any(|state| {
+            let Some(conn) = state.handle.upgrade() else {
+                return false;
+            };
+            !state.paths.keys().any(|id| {
+                conn.path_stats(*id)
+                    .is_some_and(|stats| stats.pto_count < UNRESPONSIVE_PTO_COUNT)
+            })
+        });
+        if missing_responsive_path {
+            // Existing candidate-only holepunching retains its five-second rate limit.
+            self.trigger_holepunching();
         }
     }
 
@@ -1326,13 +1361,12 @@ pub struct PathSelectionContext<'a> {
     source: PathsSource<'a>,
 }
 
-/// Either a reference to live connection state, or a synthesized list of paths
-/// (for unit-testing selectors).
+/// Either live connection state or a bounded candidate subset of live path handles.
+/// Unit tests can also supply candidates with synthesized statistics.
 #[derive(Debug)]
 enum PathsSource<'a> {
     Live(&'a FxHashMap<ConnId, ConnectionState>),
-    #[cfg(test)]
-    Test(Vec<PathSelectionData<'a>>),
+    Candidates(Vec<PathSelectionData<'a>>),
 }
 
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
@@ -1347,6 +1381,36 @@ impl<'a> PathSelectionContext<'a> {
         }
     }
 
+    fn backup(selected: &transports::FourTuple, mut paths: Vec<PathSelectionData<'a>>) -> Self {
+        use crate::socket::biased_rtt_path_selector::UNRESPONSIVE_PTO_COUNT;
+
+        paths.retain(|path| path.network_path().is_ip() && path.network_path() != selected);
+        let responsive = |path: &PathSelectionData<'_>| {
+            path.stats()
+                .is_some_and(|stats| stats.pto_count < UNRESPONSIVE_PTO_COUNT)
+        };
+        // Read health once so a concurrent PTO cannot empty the retained subset.
+        let responsive: Vec<_> = paths
+            .iter()
+            .filter(|path| responsive(path))
+            .cloned()
+            .collect();
+        if !responsive.is_empty() {
+            paths = responsive;
+        }
+        // Prefer a different remote over another local interface to the same remote.
+        if paths
+            .iter()
+            .any(|path| path.network_path().remote() != selected.remote())
+        {
+            paths.retain(|path| path.network_path().remote() != selected.remote());
+        }
+        Self {
+            current: None,
+            source: PathsSource::Candidates(paths),
+        }
+    }
+
     /// Constructs a context with synthetic path data for testing.
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -1355,7 +1419,7 @@ impl<'a> PathSelectionContext<'a> {
     ) -> Self {
         Self {
             current,
-            source: PathsSource::Test(paths),
+            source: PathsSource::Candidates(paths),
         }
     }
 
@@ -1380,8 +1444,7 @@ impl<'a> PathSelectionContext<'a> {
                         })
                     }),
             ),
-            #[cfg(test)]
-            PathsSource::Test(paths) => Box::new(paths.iter().cloned()),
+            PathsSource::Candidates(paths) => Box::new(paths.iter().cloned()),
         }
     }
 }
@@ -1565,6 +1628,41 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
 #[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_keeps_health_before_remote_diversity() {
+        use crate::socket::biased_rtt_path_selector::BiasedRttPathSelector;
+
+        let selected = transports::FourTuple::Ip {
+            remote: "10.37.0.2:1234".parse().unwrap(),
+            local: Some("10.37.0.1".parse().unwrap()),
+        };
+        let same_remote = transports::FourTuple::Ip {
+            remote: "10.37.0.2:1234".parse().unwrap(),
+            local: Some("10.38.0.1".parse().unwrap()),
+        };
+        let alternative = transports::FourTuple::Ip {
+            remote: "192.0.2.2:1234".parse().unwrap(),
+            local: Some("192.0.2.1".parse().unwrap()),
+        };
+        for (pto_count, expected) in [(0, &alternative), (3, &same_remote)] {
+            let mut same_stats = PathStats::default();
+            same_stats.rtt = Duration::from_millis(1);
+            let mut alternative_stats = PathStats::default();
+            alternative_stats.rtt = Duration::from_millis(12);
+            alternative_stats.pto_count = pto_count;
+            let ctx = PathSelectionContext::backup(
+                &selected,
+                vec![
+                    PathSelectionData::for_test(&selected, Some(same_stats)),
+                    PathSelectionData::for_test(&same_remote, Some(same_stats)),
+                    PathSelectionData::for_test(&alternative, Some(alternative_stats)),
+                ],
+            );
+            let backup = BiasedRttPathSelector::default().select(&ctx);
+            assert_eq!(backup.selected(), Some(expected));
+        }
+    }
 
     #[tokio::test]
     async fn blocked_relay_does_not_delay_direct_initial() {

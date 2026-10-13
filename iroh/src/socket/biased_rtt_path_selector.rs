@@ -22,6 +22,9 @@ const IPV6_RTT_ADVANTAGE: Duration = Duration::from_millis(3);
 /// happens when its biased RTT is at least this much better than the current path's.
 const RTT_SWITCHING_MIN: Duration = Duration::from_millis(5);
 
+/// Several consecutive unanswered probes are current loss evidence, not old loss history.
+pub(super) const UNRESPONSIVE_PTO_COUNT: u32 = 3;
+
 /// Whether a transport is a primary path or a backup.
 ///
 /// Primary paths are used preferentially.  Backup paths are only used when no primary
@@ -78,8 +81,8 @@ impl TransportBias {
 
 /// The default [`PathSelector`] used by iroh.
 ///
-/// Sorts paths by `(transport_type, biased_rtt)` (primary tier wins, then lowest biased
-/// RTT).  Within the same tier, switching only happens once a candidate's biased RTT is
+/// Sorts paths by `(unresponsive, transport_type, biased_rtt)` (responsive paths win,
+/// then primary tier and lowest biased RTT).  Within the same tier, switching only happens once a candidate's biased RTT is
 /// at least 5ms better than the currently-selected path — this avoids flapping under
 /// jitter.  Across tiers, switching is immediate.
 ///
@@ -135,13 +138,23 @@ impl BiasedRttPathSelector {
 
 impl PathSelector for BiasedRttPathSelector {
     fn select(&self, ctx: &PathSelectionContext<'_>) -> PathSelection {
-        // Single pass: track the best candidate by sort key, and the best (lowest)
-        // sort key seen for the currently-selected address.  When the same address
-        // appears multiple times (one path per connection), `min` over `sort_key`
-        // naturally picks the lowest-RTT instance — no separate aggregation needed.
+        // Aggregate responsiveness across connections before ranking candidate RTTs.
+        // For repeated addresses, the lowest RTT wins after their shared health check.
         let current = ctx.current();
-        let mut best: Option<(PathSelectionData<'_>, (TransportType, i128))> = None;
-        let mut current_key: Option<(TransportType, i128)> = None;
+        // Selection is shared by all Connections to a peer. A healthy Connection
+        // must not hide another Connection's unanswered probes on the same path.
+        let mut unresponsive = FxHashMap::default();
+        for path in ctx.paths() {
+            if let Some(stats) = path.stats() {
+                let degraded = stats.pto_count >= UNRESPONSIVE_PTO_COUNT;
+                unresponsive
+                    .entry(path.network_path().clone())
+                    .and_modify(|value| *value |= degraded)
+                    .or_insert(degraded);
+            }
+        }
+        let mut best: Option<(PathSelectionData<'_>, (bool, TransportType, i128))> = None;
+        let mut current_key: Option<(bool, TransportType, i128)> = None;
 
         trace!("dumping path RTTs");
         for psd in ctx.paths() {
@@ -151,8 +164,13 @@ impl PathSelector for BiasedRttPathSelector {
                 continue;
             };
             let rtt = stats.rtt;
-            trace!(%network_path, ?rtt);
-            let key = self.sort_key(network_path, rtt);
+            trace!(%network_path, ?rtt, pto_count = stats.pto_count);
+            let (tier, biased_rtt) = self.sort_key(network_path, rtt);
+            let key = (
+                unresponsive.get(network_path).copied().unwrap_or(true),
+                tier,
+                biased_rtt,
+            );
 
             if Some(network_path) == current && current_key.is_none_or(|c| key < c) {
                 current_key = Some(key);
@@ -163,18 +181,18 @@ impl PathSelector for BiasedRttPathSelector {
         }
 
         let mut selection = PathSelection::none();
-        let Some((best_psd, (best_tier, best_biased))) = best else {
+        let Some((best_psd, (best_unresponsive, best_tier, best_biased))) = best else {
             return selection;
         };
 
         // If we have no current path or no data for it, switch to the best.
-        let Some((current_tier, current_biased)) = current_key else {
+        let Some((current_unresponsive, current_tier, current_biased)) = current_key else {
             selection.set(&best_psd);
             return selection;
         };
 
-        if current_tier != best_tier {
-            // Always switch across tiers (e.g. relay -> primary).
+        if current_unresponsive != best_unresponsive || current_tier != best_tier {
+            // Responsiveness takes precedence over a stale RTT and transport tier.
             selection.set(&best_psd);
         } else if best_biased + RTT_SWITCHING_MIN.as_nanos() as i128 <= current_biased {
             // For the same tier, only switch when biased RTT is meaningfully better.
@@ -309,6 +327,64 @@ mod tests {
         let v4_2 = v4(2);
         let chosen = select_with_default(None, vec![psd(&v4_1, 20), psd(&v4_2, 10)]);
         assert_eq!(chosen.as_ref(), Some(&v4_2));
+    }
+
+    fn unresponsive(addr: &transports::FourTuple, rtt_ms: u64) -> PathSelectionData<'_> {
+        let mut stats = PathStats::default();
+        stats.rtt = Duration::from_millis(rtt_ms);
+        stats.pto_count = 3;
+        PathSelectionData::for_test(addr, Some(stats))
+    }
+
+    #[test]
+    fn unresponsive_current_path_does_not_pin_fresh_alternative() {
+        let current = v4(1);
+        let alternative = v4(2);
+        // A stale 1ms RTT must not beat a validated responsive 12ms path.
+        let chosen = select_with_default(
+            Some(&current),
+            vec![unresponsive(&current, 1), psd(&alternative, 12)],
+        );
+        assert_eq!(chosen.as_ref(), Some(&alternative));
+    }
+
+    #[test]
+    fn one_healthy_connection_cannot_mask_another_blackholed_connection() {
+        let current = v4(1);
+        let alternative = v4(2);
+        for paths in [
+            vec![
+                psd(&current, 1),
+                unresponsive(&current, 2),
+                psd(&alternative, 12),
+            ],
+            vec![
+                unresponsive(&current, 2),
+                psd(&current, 1),
+                psd(&alternative, 12),
+            ],
+        ] {
+            let chosen = select_with_default(Some(&current), paths);
+            assert_eq!(chosen.as_ref(), Some(&alternative));
+        }
+    }
+
+    #[test]
+    fn all_paths_unresponsive_keep_current_and_recovered_rtt_still_wins() {
+        let current = v4(1);
+        let alternative = v4(2);
+        assert_eq!(
+            select_with_default(
+                Some(&current),
+                vec![unresponsive(&current, 1), unresponsive(&alternative, 12)]
+            ),
+            None
+        );
+        let chosen = select_with_default(
+            Some(&alternative),
+            vec![psd(&current, 1), psd(&alternative, 12)],
+        );
+        assert_eq!(chosen.as_ref(), Some(&current));
     }
 
     #[test]
